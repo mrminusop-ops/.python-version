@@ -1,6 +1,7 @@
 Flask==3.0.3
 aiohttp==3.10.10
 gunicorn==23.0.0
+hypercorn==0.17.3
 uvloop==0.21.0
 quart==0.19.9
 quart-cors==0.7.0
