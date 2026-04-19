@@ -1,1 +1,1 @@
-web: gunicorn --bind 0.0.0.0:$PORT --workers 4 --timeout 120 "bot:app"
+web: hypercorn bot:app --bind 0.0.0.0:8080
